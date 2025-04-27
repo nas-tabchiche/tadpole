@@ -14,14 +14,12 @@ from helpers import (
 )
 
 logger.remove()  # Remove default logger
-logger.add("crawler_debug.log", rotation="10 MB", level="TRACE")  # Log debug to file
+logger.add("crawler_debug.log", rotation="10 MB", level="TRACE", encoding="utf-8")
 logger.add(lambda msg: print(msg, end=""), level="DEBUG", format="{message}")
 
 
-async def process_repo(
-    session, repo_info, headers, semaphore, output_file_handle
-) -> int:
-    """Fetches tree, filters files, fetches content, and writes to output for a single repo."""
+async def process_repo(session, repo_info, headers, semaphore, output_file_handle):
+    """Fetches tree, filters files, fetches content, and writes raw data to output file."""
     owner = repo_info["owner"]["login"]
     repo_name = repo_info["name"]
     repo_url = repo_info["html_url"]
@@ -47,7 +45,9 @@ async def process_repo(
             files_to_process.append(file_info)
 
     if not files_to_process:
-        logger.info(f"No relevant files found in {owner}/{repo_name}")
+        logger.info(
+            f"No relevant files found in {owner}/{repo_name} after initial filtering."
+        )
         return 0
 
     logger.info(
@@ -64,27 +64,24 @@ async def process_repo(
         )
         blob_tasks.append((task, file_info))  # Keep track of file_info with its task
 
-    files_processed_count = 0
+    files_written_count = 0
     for task, file_info in blob_tasks:
         try:
             # Timeout per blob fetch task can be added here if needed
             content = await asyncio.wait_for(task, timeout=60.0)
 
             if content:
-                # CPU-bound sanitization - could run in executor if becomes bottleneck
-                findings = sanitize_content(content)
-
+                # Prepare RAW output data - Sanitization will happen in the next pipeline stage
                 output_data = {
                     "repo_url": repo_url,
                     "path": file_info["path"],
                     "size": file_info.get("size"),
                     "license": repo_license,
-                    "content_sha": file_info["sha"],
-                    "findings": findings,
-                    "content": content,  # Storing full content now
+                    "content_sha": file_info["sha"],  # Git SHA of the blob
+                    "content": content,  # Store the full content
                 }
                 output_file_handle.write(json.dumps(output_data) + "\n")
-                files_processed_count += 1
+                files_written_count += 1
             else:
                 logger.warning(
                     f"Could not fetch or decode content for {file_info['path']} in {owner}/{repo_name}"
@@ -99,9 +96,9 @@ async def process_repo(
             )
 
     logger.info(
-        f"Finished processing {owner}/{repo_name} ({files_processed_count} files written)"
+        f"Finished processing {owner}/{repo_name} ({files_written_count} raw files written)"
     )
-    return files_processed_count
+    return files_written_count
 
 
 async def main():
@@ -121,7 +118,11 @@ async def main():
     semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
 
     # Use a single session for connection pooling
-    async with aiohttp.ClientSession(headers=headers) as session:
+    # Increase timeout settings for potentially slow API responses
+    timeout = aiohttp.ClientTimeout(
+        total=120, connect=30, sock_connect=30, sock_read=60
+    )
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         # Construct search query
         license_query_part = ""
         if settings.REQUIRED_LICENSES:
@@ -129,7 +130,11 @@ async def main():
                 [f"license:{lic}" for lic in settings.REQUIRED_LICENSES]
             )
 
-        query = f"language:{settings.TARGET_LANGUAGE} stars:>{settings.MIN_STARS} pushed:>{settings.MIN_PUSH_DATE} {license_query_part}".strip()
+        # Focus search on the target language
+        query = (
+            f"language:{settings.TARGET_LANGUAGE} stars:>{settings.MIN_STARS} pushed:>{settings.MIN_PUSH_DATE} {license_query_part}".strip()
+            + " is:public"
+        )
 
         # Initial search
         # TODO: Handle paginated responses
@@ -151,7 +156,7 @@ async def main():
             f"Attempting to process details for {len(repos_to_process)} repositories."
         )
 
-        with open(settings.OUTPUT_FILE, "w", encoding="utf-8") as f:
+        with open(settings.RAW_OUTPUT_FILE, "w", encoding="utf-8") as f:
             # Create tasks to process repositories concurrently
             repo_tasks = [
                 process_repo(session, repo, headers, semaphore, f)
@@ -161,7 +166,7 @@ async def main():
             # Wait for all repository processing tasks to complete
             results = await asyncio.gather(*repo_tasks, return_exceptions=True)
 
-            total_files_processed = 0
+            total_files_written = 0
             processed_repo_count = 0
             for i, result in enumerate(results):
                 repo_name = f"{repos_to_process[i]['owner']['login']}/{repos_to_process[i]['name']}"
@@ -170,21 +175,31 @@ async def main():
                 elif (
                     result is not None
                 ):  # process_repo returns file count or None on initial skip
-                    processed_repo_count += 1
-                    total_files_processed += (
+                    # Only count repos where we actually attempted to process files
+                    if (
+                        await get_repo_tree(
+                            session,
+                            repos_to_process[i]["owner"]["login"],
+                            repos_to_process[i]["name"],
+                            headers,
+                            semaphore,
+                        )
+                        is not None
+                    ):
+                        processed_repo_count += 1
+                    total_files_written += (
                         result  # Add count of files processed for this repo
                     )
-                # Else: Repo was skipped intentionally (e.g., license), already logged.
 
     end_time = time.time()
-    logger.info("Crawling Summary")
+    logger.info("Crawling Stage Summary")
     logger.info(f"Crawling finished in {end_time - start_time:.2f} seconds.")
     logger.info(f"Attempted to process {len(repos_to_process)} repositories.")
     logger.info(
         f"Successfully processed details for {processed_repo_count} repositories."
     )
-    logger.info(f"Total files written: {total_files_processed}")
-    logger.info(f"Output data saved to {settings.OUTPUT_FILE}")
+    logger.info(f"Total raw files written: {total_files_written}")
+    logger.info(f"Raw output data saved to {settings.RAW_OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
