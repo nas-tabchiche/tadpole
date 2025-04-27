@@ -13,6 +13,7 @@ from helpers import (
     search_repositories,
 )
 
+logger.remove()  # Remove default logger
 logger.add("crawler_debug.log", rotation="10 MB", level="TRACE")  # Log debug to file
 logger.add(lambda msg: print(msg, end=""), level="DEBUG", format="{message}")
 
