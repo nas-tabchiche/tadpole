@@ -160,8 +160,8 @@ async def get_repo_tree(session, owner, repo, headers, semaphore):
     # Check license against requirements
     if (
         settings.REQUIRED_LICENSES
-        and repo_license not in settings.REQUIRED_LICENSES
-        and repo_license != "NOASSERTION"
+        and repo_license.lower() not in settings.REQUIRED_LICENSES
+        and repo_license.upper() != "NOASSERTION"
     ):
         logger.info(
             f"Skipping repo {owner}/{repo}: License '{repo_license}' not in required list {settings.REQUIRED_LICENSES}."
